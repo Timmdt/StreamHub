@@ -1,6 +1,6 @@
-import type { CatalogItem, Provider } from "./types";
+import type { CatalogItem, LegacyProvider } from "./types";
 
-export const providers: Provider[] = [
+export const providers: LegacyProvider[] = [
   {
     key: "netflix",
     name: "Netflix",

@@ -1,4 +1,4 @@
-import type { Provider, Title } from "./types";
+import type { EpisodeProviderLink, MediaType, Provider } from "./types";
 
 export const PROVIDERS: Provider[] = [
   { id: 8, name: "Netflix", short: "N", color: "#e50914" },
@@ -50,12 +50,30 @@ export function trustedProviderTitleUrl(providerId: number, value: string | null
   return trustedUrl(value, PROVIDER_DOMAINS[providerId] ?? []);
 }
 
+const VERIFIED_SERIES_LINKS = new Map<string, EpisodeProviderLink[]>([
+  ["tv:1429", [{
+    providerId: 283,
+    url: "https://www.crunchyroll.com/de/series/G24H1NM05/attack-on-titan-dubs",
+    directVideo: false,
+    scope: "series",
+  }]],
+  ["tv:123249", [{
+    providerId: 283,
+    url: "https://www.crunchyroll.com/de/series/GQWH0M9N8/my-dress-up-darling",
+    directVideo: false,
+    scope: "series",
+  }]],
+]);
+
+export function verifiedSeriesProviderLinks(mediaType: MediaType, tmdbId: number) {
+  return (VERIFIED_SERIES_LINKS.get(`${mediaType}:${tmdbId}`) ?? [])
+    .filter((link) => Boolean(trustedProviderTitleUrl(link.providerId, link.url)));
+}
+
 export function providerTitleDestination(
   provider: Pick<Provider, "id" | "link">,
-  title: Pick<Title, "homepage">,
 ): ProviderTitleDestination | null {
-  const directLink = trustedProviderTitleUrl(provider.id, provider.link)
-    ?? trustedProviderTitleUrl(provider.id, title.homepage);
+  const directLink = trustedProviderTitleUrl(provider.id, provider.link);
   return directLink ? { url: directLink, kind: "direct" } : null;
 }
 

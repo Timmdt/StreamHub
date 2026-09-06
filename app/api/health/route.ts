@@ -4,6 +4,6 @@ export async function GET() {
   return NextResponse.json({
     ok: true,
     app: "StreamHub",
-    version: "0.5.0"
+    version: "0.9.1"
   });
 }

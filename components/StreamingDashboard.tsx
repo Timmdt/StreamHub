@@ -38,7 +38,7 @@ import type {
   CategoryKey,
   InactiveReason,
   ProviderKey,
-  Subscription,
+  LegacySubscription as Subscription,
   TitleDetail,
   WatchHistoryEntry
 } from "@/lib/types";
@@ -754,7 +754,7 @@ export default function StreamingDashboard() {
 
   useEffect(() => {
     if (provider !== "all" && !activeProviderKeys.includes(provider)) setProvider("all");
-  }, [provider, activeProviderParam]);
+  }, [provider, activeProviderKeys]);
 
   useEffect(() => {
     if (tab !== "discover" || query.trim().length >= 2) return;
@@ -809,7 +809,7 @@ export default function StreamingDashboard() {
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [query, provider, activeProviderParam]);
+  }, [query, provider, activeProviderKeys]);
 
   useEffect(() => {
     if (!selectedItem) {
@@ -1269,6 +1269,8 @@ export default function StreamingDashboard() {
 
         <footer className="credits">
           <div className="credit-row">
+            {/* The externally hosted official attribution logo must stay unmodified. */}
+            {/* eslint-disable-next-line @next/next/no-img-element */}
             <img src="https://www.themoviedb.org/assets/2/v4/logos/v2/blue_long_2-9665a76b1ae401a510ec1e0ca40ddcb3b0cfe45f1d51b77a308fea0845885648.svg" alt="TMDB" />
             <span>This product uses the TMDB API but is not endorsed or certified by TMDB.</span>
           </div>

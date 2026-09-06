@@ -1,6 +1,7 @@
 import { demoTitles } from "./demo";
-import { CATEGORY_OPTIONS, PROVIDER_BY_ID, PROVIDERS, trustedProviderTitleUrl } from "./providers";
-import type { CatalogResponse, MediaType, Provider, Title } from "./types";
+import { CATEGORY_OPTIONS, PROVIDER_BY_ID, PROVIDERS, verifiedSeriesProviderLinks } from "./providers";
+import { streamingAvailability } from "./streaming-availability";
+import type { CatalogResponse, EpisodeGuide, MediaType, Provider, Title } from "./types";
 
 const API_ROOT = "https://api.themoviedb.org/3";
 const REGION = "DE";
@@ -46,11 +47,26 @@ type WatchProviders = {
   >;
 };
 
+type TmdbSeasonDetails = {
+  name?: string;
+  episodes?: {
+    episode_number?: number;
+    name?: string;
+    overview?: string;
+    air_date?: string | null;
+    still_path?: string | null;
+  }[];
+};
+
 export function hasTmdbToken() {
   return Boolean(process.env.TMDB_READ_TOKEN?.trim());
 }
 
-async function tmdb<T>(path: string, params: Record<string, string | number | undefined> = {}) {
+export async function tmdbFetch<T>(
+  path: string,
+  params: Record<string, string | number | undefined> = {},
+  revalidateSeconds = 60 * 30,
+) {
   const token = process.env.TMDB_READ_TOKEN?.trim();
   if (!token) throw new Error("TMDB_READ_TOKEN is missing");
   const url = new URL(`${API_ROOT}${path}`);
@@ -60,16 +76,18 @@ async function tmdb<T>(path: string, params: Record<string, string | number | un
   });
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${token}`, accept: "application/json" },
-    next: { revalidate: 60 * 30 },
+    next: { revalidate: revalidateSeconds },
   });
   if (!response.ok) throw new Error(`TMDB ${response.status} for ${path}`);
   return (await response.json()) as T;
 }
 
+const tmdb = tmdbFetch;
+
 function toBaseTitle(raw: TmdbResult, fallbackType: MediaType): Title {
   const mediaType: MediaType = raw.media_type === "tv" || raw.media_type === "movie" ? raw.media_type : fallbackType;
   const genreIds = raw.genre_ids ?? raw.genres?.map((genre) => genre.id) ?? [];
-  const isAnime = mediaType === "tv" && genreIds.includes(16) && (raw.origin_country?.includes("JP") || raw.original_language === "ja");
+  const isAnime = genreIds.includes(16) && (raw.origin_country?.includes("JP") || raw.original_language === "ja");
   return {
     id: raw.id,
     mediaType,
@@ -101,7 +119,8 @@ async function availability(mediaType: MediaType, id: number) {
     for (const item of all) {
       const normalizedName = item.provider_name.toLocaleLowerCase("en");
       const known = PROVIDER_BY_ID.get(item.provider_id)
-        ?? (normalizedName.includes("netflix") ? PROVIDER_BY_ID.get(8) : undefined);
+        ?? (normalizedName.includes("netflix") ? PROVIDER_BY_ID.get(8) : undefined)
+        ?? (normalizedName.startsWith("amazon prime video") ? PROVIDER_BY_ID.get(119) : undefined);
       const providerId = known?.id ?? item.provider_id;
       if (seen.has(providerId)) continue;
       seen.add(providerId);
@@ -139,70 +158,6 @@ async function hydrateMany(results: TmdbResult[], fallbackType: MediaType, maxim
 function providerQuery(providerIds: number[]) {
   const ids = providerIds.filter((id) => PROVIDER_BY_ID.has(id));
   return (ids.length ? ids : PROVIDERS.map((provider) => provider.id)).join("|");
-}
-
-function trustedWatchPage(value: string | undefined) {
-  if (!value) return null;
-  try {
-    const url = new URL(value);
-    const hostname = url.hostname.toLocaleLowerCase("en").replace(/^www\./, "");
-    return url.protocol === "https:" && hostname === "themoviedb.org" ? url.toString() : null;
-  } catch {
-    return null;
-  }
-}
-
-function decodeHtmlAttribute(value: string) {
-  return value
-    .replaceAll("&amp;", "&")
-    .replaceAll("&#38;", "&")
-    .replaceAll("&quot;", '"');
-}
-
-function unwrapDestination(value: string | null) {
-  if (!value) return [];
-  const candidates = [value];
-  try {
-    const url = new URL(value);
-    for (const key of ["u", "url", "redirect", "redirect_url", "destination"]) {
-      const nested = url.searchParams.get(key);
-      if (nested?.startsWith("https://")) candidates.unshift(nested);
-    }
-  } catch {
-    return candidates;
-  }
-  return candidates;
-}
-
-async function directProviderLinks(watchLink: string | undefined) {
-  const pageUrl = trustedWatchPage(watchLink);
-  const links = new Map<number, string>();
-  if (!pageUrl) return links;
-
-  try {
-    const response = await fetch(pageUrl, {
-      headers: { accept: "text/html", "user-agent": "StreamHub/0.7" },
-      next: { revalidate: 60 * 60 * 6 },
-    });
-    if (!response.ok) return links;
-    const html = await response.text();
-    const matches = html.matchAll(/href=["'](https:\/\/click\.justwatch\.com\/a\?[^"']+)["']/gi);
-
-    for (const match of matches) {
-      const clickout = new URL(decodeHtmlAttribute(match[1]));
-      const destination = clickout.searchParams.get("r");
-      for (const provider of PROVIDERS) {
-        const trusted = unwrapDestination(destination)
-          .map((candidate) => trustedProviderTitleUrl(provider.id, candidate))
-          .find(Boolean);
-        if (trusted && !links.has(provider.id)) links.set(provider.id, trusted);
-      }
-    }
-  } catch {
-    return links;
-  }
-
-  return links;
 }
 
 const tvGenreMap: Record<number, number> = {
@@ -272,7 +227,15 @@ export async function discoverCatalog(options: {
     if (kind === "movies") movie = await discoverType("movie", page, providerIds, genre ?? tasteGenres[0]);
     else if (kind === "series") tv = await discoverType("tv", page, providerIds, genre ?? tasteGenres[0]);
     else if (kind === "anime") {
-      tv = await discoverType("tv", page, providerIds, 16, { with_origin_country: "JP", with_original_language: "ja" });
+      [movie, tv] = await Promise.all([
+        discoverType("movie", page, providerIds, 16, { with_origin_country: "JP", with_original_language: "ja" }),
+        discoverType("tv", page, providerIds, 16, { with_origin_country: "JP", with_original_language: "ja" }),
+      ]);
+    } else if (kind === "category") {
+      [movie, tv] = await Promise.all([
+        discoverType("movie", page, providerIds, genre),
+        discoverType("tv", page, providerIds, genre),
+      ]);
     } else if (genre && [27, 53, 10749].includes(genre)) {
       movie = await discoverType("movie", page, providerIds, genre);
     } else {
@@ -286,7 +249,7 @@ export async function discoverCatalog(options: {
       ...(movie?.results ?? []).map((result) => ({ ...result, media_type: "movie" })),
       ...(tv?.results ?? []).map((result) => ({ ...result, media_type: "tv" })),
     ].sort((a, b) => (b.popularity ?? 0) - (a.popularity ?? 0));
-    const results = await hydrateMany(combined, kind === "movies" ? "movie" : "tv", kind === "catalog" ? 36 : 24);
+    const results = await hydrateMany(combined, kind === "movies" ? "movie" : "tv", ["catalog", "category", "anime"].includes(kind) ? 36 : 24);
     return {
       source: "tmdb" as const,
       page,
@@ -381,18 +344,70 @@ export async function searchCatalog(query: string, providerIds: number[]) {
   }
 }
 
-export async function titleDetails(mediaType: MediaType, id: number) {
+export async function searchCategoryCatalog(query: string, categoryId: number, providerIds: number[]) {
+  const data = await searchCatalog(query, providerIds);
+  const selectedProviders = new Set(providerIds.length ? providerIds : PROVIDERS.map((provider) => provider.id));
+  const mappedTvGenre = tvGenreMap[categoryId] ?? categoryId;
+  const results = data.results.filter((title) => {
+    const categoryMatch = categoryId === 90001
+      ? Boolean(title.anime)
+      : title.genreIds.includes(categoryId) || title.genreIds.includes(mappedTvGenre);
+    const providerMatch = title.providers.some((provider) => selectedProviders.has(provider.id));
+    return categoryMatch && providerMatch;
+  });
+  return { ...data, page: 1, totalPages: 1, results };
+}
+
+export async function watchOrderTitleDetails(mediaType: MediaType, id: number) {
   if (!hasTmdbToken()) return demoTitles().find((title) => title.id === id) ?? null;
   try {
     const raw = await tmdb<TmdbResult>(`/${mediaType}/${id}`);
-    const hydrated = await hydrate(raw, mediaType);
-    const providerLinks = await directProviderLinks(hydrated.watchLink);
+    return hydrate(raw, mediaType);
+  } catch (error) {
+    console.error(error);
+    return null;
+  }
+}
+
+export async function titleDetails(mediaType: MediaType, id: number) {
+  if (!hasTmdbToken()) return demoTitles().find((title) => title.id === id) ?? null;
+  try {
+    const [raw, streaming] = await Promise.all([
+      tmdb<TmdbResult>(`/${mediaType}/${id}`),
+      streamingAvailability(mediaType, id),
+    ]);
+    const [hydrated, episodeGuide] = await Promise.all([
+      hydrate(raw, mediaType),
+      mediaType === "tv" ? localizedEpisodeGuide(id, streaming.episodeGuide, raw.number_of_seasons) : streaming.episodeGuide,
+    ]);
+    const verifiedSeriesLinks = verifiedSeriesProviderLinks(mediaType, id);
+    const episodeGuideWithFallbacks = episodeGuide?.status === "ready" && verifiedSeriesLinks.length
+      ? {
+          ...episodeGuide,
+          seasons: episodeGuide.seasons.map((season) => ({
+            ...season,
+            providerLinks: uniqueEpisodeLinks([...season.providerLinks, ...verifiedSeriesLinks]),
+          })),
+        }
+      : episodeGuide;
+    const providerLinks = new Map(
+      [...streaming.titleLinks, ...verifiedSeriesLinks].map((link) => [link.providerId, link.url]),
+    );
+    const providers = new Map(streaming.linkedProviders.map((provider) => [provider.id, provider]));
+    verifiedSeriesLinks.forEach((link) => {
+      const provider = PROVIDER_BY_ID.get(link.providerId);
+      if (provider) providers.set(provider.id, provider);
+    });
+    hydrated.providers.forEach((provider) => {
+      providers.set(provider.id, { ...providers.get(provider.id), ...provider });
+    });
     return {
       ...hydrated,
-      providers: hydrated.providers.map((provider) => ({
+      providers: [...providers.values()].map((provider) => ({
         ...provider,
         link: providerLinks.get(provider.id),
       })),
+      episodeGuide: episodeGuideWithFallbacks,
     };
   } catch (error) {
     console.error(error);
@@ -400,8 +415,210 @@ export async function titleDetails(mediaType: MediaType, id: number) {
   }
 }
 
+function uniqueEpisodeLinks(links: EpisodeGuide["seasons"][number]["providerLinks"]) {
+  const unique = new Map<number, (typeof links)[number]>();
+  const scopeRank = { series: 0, season: 1, episode: 2 } as const;
+  links.forEach((link) => {
+    const current = unique.get(link.providerId);
+    const currentRank = current?.scope ? scopeRank[current.scope] : 0;
+    const nextRank = link.scope ? scopeRank[link.scope] : 0;
+    if (!current || nextRank > currentRank || (nextRank === currentRank && link.directVideo && !current.directVideo)) {
+      unique.set(link.providerId, link);
+    }
+  });
+  return [...unique.values()];
+}
+
+function localizeEpisodes(
+  episodes: EpisodeGuide["seasons"][number]["episodes"],
+  localized: TmdbSeasonDetails,
+) {
+  const metadata = new Map(
+    (localized.episodes ?? []).map((episode, index) => [episode.episode_number ?? index + 1, episode]),
+  );
+
+  return episodes.map((episode, index) => {
+    const number = index + 1;
+    const german = metadata.get(number);
+    const germanTitle = german?.name?.trim();
+    const germanOverview = german?.overview?.trim();
+    const localizedYear = Number(german?.air_date?.slice(0, 4));
+    return {
+      ...episode,
+      number,
+      title: germanTitle || episode.title,
+      overview: germanOverview || "Für diese Folge ist noch keine deutsche Beschreibung verfügbar.",
+      year: Number.isFinite(localizedYear) && localizedYear > 0 ? localizedYear : episode.year,
+      stillPath: german?.still_path ?? null,
+    };
+  });
+}
+
+type SourceSeasonChunk = {
+  number: number;
+  title: string;
+  episodes: EpisodeGuide["seasons"][number]["episodes"];
+  providerLinks: EpisodeGuide["seasons"][number]["providerLinks"];
+};
+
+function splitSeasonAtYearGap(season: EpisodeGuide["seasons"][number]): SourceSeasonChunk[] {
+  if (season.episodes.length < 18) {
+    return [{ number: season.number, title: season.title, episodes: season.episodes, providerLinks: season.providerLinks }];
+  }
+
+  const boundaries: number[] = [];
+  for (let index = 1; index < season.episodes.length; index += 1) {
+    const previousYear = season.episodes[index - 1].year;
+    const currentYear = season.episodes[index].year;
+    if (previousYear && currentYear && currentYear - previousYear >= 2 && index >= 6 && season.episodes.length - index >= 6) {
+      boundaries.push(index);
+    }
+  }
+  if (!boundaries.length) {
+    return [{ number: season.number, title: season.title, episodes: season.episodes, providerLinks: season.providerLinks }];
+  }
+
+  const cuts = [0, ...boundaries, season.episodes.length];
+  const episodeProviderCounts = new Map<number, number>();
+  season.episodes.forEach((episode) => episode.providerLinks.forEach((link) => {
+    episodeProviderCounts.set(link.providerId, (episodeProviderCounts.get(link.providerId) ?? 0) + 1);
+  }));
+
+  return cuts.slice(0, -1).map((start, chunkIndex) => {
+    const end = cuts[chunkIndex + 1];
+    const episodes = season.episodes.slice(start, end);
+    const providerLinks = season.providerLinks.filter((link) => {
+      const hasEpisodeEvidence = (episodeProviderCounts.get(link.providerId) ?? 0) > 0;
+      return !hasEpisodeEvidence || episodes.some((episode) => episode.providerLinks.some((item) => item.providerId === link.providerId));
+    });
+    const number = season.number + chunkIndex;
+    return {
+      number,
+      title: chunkIndex === 0 ? season.title : `Staffel ${number}`,
+      episodes,
+      providerLinks,
+    };
+  });
+}
+
+async function localizedEpisodeGuide(seriesId: number, guide?: EpisodeGuide, expectedSeasonCount?: number | null) {
+  if (!guide || guide.status !== "ready") return guide;
+
+  const guideNumbers = guide.seasons.map((season) => season.number);
+  const largestGuideNumber = Math.max(0, ...guideNumbers);
+  const lastSeasonNumber = Math.max(expectedSeasonCount ?? 0, largestGuideNumber);
+  const seasonNumbers = [
+    ...(guideNumbers.includes(0) ? [0] : []),
+    ...Array.from({ length: lastSeasonNumber }, (_, index) => index + 1),
+  ];
+  const details = new Map<number, TmdbSeasonDetails>();
+
+  await Promise.all(seasonNumbers.map(async (number) => {
+    try {
+      const localized = await tmdb<TmdbSeasonDetails>(
+        `/tv/${seriesId}/season/${number}`,
+        { language: "de-DE" },
+        60 * 60 * 6,
+      );
+      details.set(number, localized);
+    } catch {
+      // A missing announced season must not hide the episode data we already have.
+    }
+  }));
+
+  const regularSourceSeasons = guide.seasons.filter((season) => season.number > 0);
+  const regularTargets = [...details.entries()]
+    .filter(([number, season]) => number > 0 && (season.episodes?.length ?? 0) > 0)
+    .sort(([numberA], [numberB]) => numberA - numberB);
+  const sourceEpisodeCount = regularSourceSeasons.reduce((sum, season) => sum + season.episodes.length, 0);
+  const targetEpisodeCount = regularTargets.reduce((sum, [, season]) => sum + (season.episodes?.length ?? 0), 0);
+  const countsMatchBySeason = regularTargets.every(([number, target]) => (
+    regularSourceSeasons.find((season) => season.number === number)?.episodes.length === target.episodes?.length
+  ));
+  const shouldRealign = regularTargets.length > 1
+    && sourceEpisodeCount === targetEpisodeCount
+    && !countsMatchBySeason;
+  const inferredSourceSeasons = regularSourceSeasons.flatMap((season) => splitSeasonAtYearGap(season));
+  const shouldInferYearSplit = regularTargets.length <= 1
+    && inferredSourceSeasons.length > regularSourceSeasons.length;
+
+  if (shouldInferYearSplit) {
+    const missingNumbers = inferredSourceSeasons
+      .map((season) => season.number)
+      .filter((number) => !details.has(number));
+    await Promise.all(missingNumbers.map(async (number) => {
+      try {
+        const localized = await tmdb<TmdbSeasonDetails>(
+          `/tv/${seriesId}/season/${number}`,
+          { language: "de-DE" },
+          60 * 60 * 6,
+        );
+        details.set(number, localized);
+      } catch {
+        // Keep the source titles and descriptions if TMDB has no matching season.
+      }
+    }));
+  }
+
+  let regularSeasons: EpisodeGuide["seasons"];
+  if (shouldInferYearSplit) {
+    regularSeasons = inferredSourceSeasons.map((season) => {
+      const localized = details.get(season.number);
+      return {
+        number: season.number,
+        title: localized?.name?.trim() || season.title,
+        providerLinks: season.providerLinks,
+        episodes: localized ? localizeEpisodes(season.episodes, localized) : localizeEpisodes(season.episodes, { episodes: [] }),
+      };
+    });
+  } else if (shouldRealign) {
+    const sourceEpisodes = regularSourceSeasons.flatMap((season) => (
+      season.episodes.map((episode) => ({ episode, providerLinks: season.providerLinks }))
+    ));
+    let cursor = 0;
+    regularSeasons = regularTargets.map(([number, localized]) => {
+      const episodeCount = localized.episodes?.length ?? 0;
+      const slice = sourceEpisodes.slice(cursor, cursor + episodeCount);
+      cursor += episodeCount;
+      return {
+        number,
+        title: localized.name?.trim() || `Staffel ${number}`,
+        providerLinks: uniqueEpisodeLinks(slice.flatMap((item) => item.providerLinks)),
+        episodes: localizeEpisodes(slice.map((item) => item.episode), localized),
+      };
+    });
+  } else {
+    regularSeasons = regularSourceSeasons.map((season) => {
+      const localized = details.get(season.number);
+      if (!localized) return season;
+      return {
+        ...season,
+        title: localized.name?.trim() || season.title,
+        episodes: localizeEpisodes(season.episodes, localized),
+      };
+    });
+  }
+
+  const specialSeasons = guide.seasons.filter((season) => season.number === 0).map((season) => {
+    const localized = details.get(0);
+    if (!localized) return season;
+    return {
+      ...season,
+      title: localized.name?.trim() || season.title,
+      episodes: localizeEpisodes(season.episodes, localized),
+    };
+  });
+  const seasons = [...specialSeasons, ...regularSeasons].sort((a, b) => a.number - b.number);
+
+  return { ...guide, seasons };
+}
+
 export async function categoryCovers() {
-  if (!hasTmdbToken()) return { source: "demo" as const, covers: {} as Record<string, string> };
+  if (!hasTmdbToken()) return {
+    source: "demo" as const,
+    covers: {} as Record<string, string>,
+    coverSets: {} as Record<string, string[]>,
+  };
 
   const candidates = await Promise.all(CATEGORY_OPTIONS.map(async (category, categoryIndex) => {
     try {
@@ -420,18 +637,22 @@ export async function categoryCovers() {
     }
   }));
 
-  const used = new Set<string>();
-  const entries = candidates.map(([id, paths, categoryIndex]) => {
-    const offset = paths.length ? (categoryIndex * 3) % paths.length : 0;
-    const rotated = [...paths.slice(offset), ...paths.slice(0, offset)];
-    const uniquePath = rotated.find((path) => !used.has(path)) ?? rotated[0] ?? "";
-    if (uniquePath) used.add(uniquePath);
-    return [id, uniquePath] as const;
+  const usedFirstImages = new Set<string>();
+  const coverSetEntries = candidates.map(([id, paths, categoryIndex]) => {
+    const uniquePaths = [...new Set(paths)];
+    const offset = uniquePaths.length ? (categoryIndex * 3) % uniquePaths.length : 0;
+    const rotated = [...uniquePaths.slice(offset), ...uniquePaths.slice(0, offset)];
+    const first = rotated.find((path) => !usedFirstImages.has(path)) ?? rotated[0] ?? "";
+    if (first) usedFirstImages.add(first);
+    const alternatives = rotated.filter((path) => path !== first);
+    return [id, [first, ...alternatives].filter(Boolean).slice(0, 6)] as const;
   });
+  const coverSets = Object.fromEntries(coverSetEntries.filter(([, paths]) => paths.length));
 
   return {
     source: "tmdb" as const,
-    covers: Object.fromEntries(entries.filter(([, path]) => Boolean(path))),
+    covers: Object.fromEntries(Object.entries(coverSets).map(([id, paths]) => [id, paths[0]])),
+    coverSets,
   };
 }
 
@@ -442,9 +663,13 @@ export async function officialProviders() {
       watch_region: REGION,
     });
     const logos = new Map(data.results.map((item) => [item.provider_id, item.logo_path]));
+    const primeVideoLogo = data.results.find((item) => item.provider_name.toLocaleLowerCase("de").includes("prime video"))?.logo_path;
     return {
       source: "tmdb" as const,
-      providers: PROVIDERS.map((provider) => ({ ...provider, logoPath: logos.get(provider.id) ?? null })),
+      providers: PROVIDERS.map((provider) => ({
+        ...provider,
+        logoPath: logos.get(provider.id) ?? (provider.id === 119 ? primeVideoLogo : null) ?? null,
+      })),
     };
   } catch {
     return { source: "demo" as const, providers: PROVIDERS };
