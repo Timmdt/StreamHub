@@ -1,6 +1,7 @@
 "use client";
 
 import Image from "next/image";
+import { useRouter } from "next/navigation";
 import {
   Bell,
   Bookmark,
@@ -13,6 +14,7 @@ import {
   Clock3,
   Compass,
   ExternalLink,
+  Eye,
   Film,
   Heart,
   Home,
@@ -34,6 +36,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CATEGORY_OPTIONS, DEFAULT_SUBSCRIPTIONS, PROVIDERS, providerTitleDestination } from "@/lib/providers";
 import type {
   CatalogResponse,
+  ExpiringCatalogResponse,
+  ExpiringTitle,
   Provider,
   Subscription,
   Title,
@@ -44,6 +48,15 @@ import type {
 
 type View = "home" | "discover" | "orders" | "expiring" | "watchlist" | "settings";
 type CategoryOption = (typeof CATEGORY_OPTIONS)[number];
+
+const VIEW_PATHS: Record<View, string> = {
+  home: "/",
+  discover: "/discover",
+  orders: "/watch-orders",
+  expiring: "/expiring-soon",
+  watchlist: "/watchlist",
+  settings: "/settings",
+};
 
 type NotificationItem = {
   id: string;
@@ -77,6 +90,29 @@ const CATEGORY_COVER_ROTATION_MS = 18_000;
 
 function titleKey(title: Pick<Title, "mediaType" | "id">) {
   return `${title.mediaType}:${title.id}`;
+}
+
+function expiryDate(timestamp: number) {
+  return new Date(timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp);
+}
+
+function formatExpiryDate(timestamp: number) {
+  return expiryDate(timestamp).toLocaleDateString("de-DE", { day: "2-digit", month: "long", year: "numeric" });
+}
+
+function daysUntilExpiry(timestamp: number) {
+  const now = new Date();
+  const target = expiryDate(timestamp);
+  const today = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+  const targetDay = Date.UTC(target.getFullYear(), target.getMonth(), target.getDate());
+  return Math.max(0, Math.round((targetDay - today) / 86_400_000));
+}
+
+function expiryCountdown(timestamp: number) {
+  const days = daysUntilExpiry(timestamp);
+  if (days === 0) return "Heute letzter Tag";
+  if (days === 1) return "Noch 1 Tag";
+  return `Noch ${days} Tage`;
 }
 
 function normalizedText(value: string) {
@@ -328,13 +364,167 @@ function TitleCard({
         >
           <Heart size={17} fill={saved ? "currentColor" : "none"} />
         </button>
-        <span className="poster-providers"><ProviderMarks providers={title.providers} limit={4} ownedProviderIds={ownedProviderIds} /></span>
+        <span className="poster-providers"><ProviderMarks providers={title.providers} ownedProviderIds={ownedProviderIds} /></span>
       </div>
       <button className="title-meta" onClick={() => onOpen(title)}>
         <span className="title-line"><strong title={title.title}>{title.title}</strong><span>★ {title.rating || "—"}</span></span>
         <span>{title.year} · {title.providers.length ? title.providers.map((provider) => provider.name).join(" · ") : "Verfügbarkeit prüfen"}</span>
       </button>
     </article>
+  );
+}
+
+function ExpiringCard({
+  item,
+  providers,
+  saved,
+  onToggle,
+  onOpen,
+}: {
+  item: ExpiringTitle;
+  providers: Provider[];
+  saved: boolean;
+  onToggle: (title: Title) => void;
+  onOpen: (title: Title) => void;
+}) {
+  const expiringServices = item.expiringProviders
+    .map((expiry) => ({ expiry, provider: providers.find((provider) => provider.id === expiry.providerId) ?? PROVIDERS.find((provider) => provider.id === expiry.providerId) }))
+    .filter((entry): entry is { expiry: ExpiringTitle["expiringProviders"][number]; provider: Provider } => Boolean(entry.provider));
+  const earliestServices = expiringServices.filter(({ expiry }) => expiry.expiresOn === item.expiresOn);
+  const providerNames = earliestServices.map(({ provider }) => provider.name).join(", ");
+  const laterDates = expiringServices.length - earliestServices.length;
+
+  return (
+    <article className="expiring-card">
+      <button className="expiring-card-visual" onClick={() => onOpen(item)} aria-label={`${item.title} öffnen`}>
+        {item.posterPath ? <Image src={`https://image.tmdb.org/t/p/w500${item.posterPath}`} alt={`Poster von ${item.title}`} fill sizes="(max-width: 700px) 42vw, 210px" /> : <span className="poster-fallback"><Play /><strong>{item.title}</strong></span>}
+        <span className="expiring-card-shade" />
+        <span className="expiring-countdown"><Clock3 /> {expiryCountdown(item.expiresOn)}</span>
+        <span className="media-pill">{item.anime ? item.mediaType === "movie" ? "ANIME · FILM" : "ANIME · SERIE" : item.mediaType === "movie" ? "FILM" : "SERIE"}</span>
+        <span className="poster-providers">
+          {expiringServices.map(({ expiry, provider }) => <ProviderMark key={provider.id} provider={provider} small muted={!expiry.link} mutedReason="kein exakter Direktlink" />)}
+        </span>
+      </button>
+      <div className="expiring-card-copy">
+        <button onClick={() => onOpen(item)} title={item.title}><strong>{item.title}</strong><span>verlässt {providerNames || "deinen Dienst"} am {formatExpiryDate(item.expiresOn)}{laterDates ? ` · ${laterDates} ${laterDates === 1 ? "weiterer Termin" : "weitere Termine"}` : ""}</span></button>
+        <button className={`expiring-save ${saved ? "active" : ""}`} onClick={() => onToggle(item)} aria-label={saved ? "Aus Watchlist entfernen" : "Zur Watchlist hinzufügen"}><Heart fill={saved ? "currentColor" : "none"} /></button>
+      </div>
+      <div className="expiring-direct-links">
+        {expiringServices.filter(({ expiry }) => expiry.link).map(({ expiry, provider }) => (
+          <a key={provider.id} href={expiry.link} target="_blank" rel="noreferrer"><Play fill="currentColor" /> Bei {provider.name} öffnen</a>
+        ))}
+      </div>
+    </article>
+  );
+}
+
+function ExpiringRail({
+  items,
+  providers,
+  watchlist,
+  onToggle,
+  onOpen,
+  onShowAll,
+}: {
+  items: ExpiringTitle[];
+  providers: Provider[];
+  watchlist: string[];
+  onToggle: (title: Title) => void;
+  onOpen: (title: Title) => void;
+  onShowAll: () => void;
+}) {
+  const railRef = useRef<HTMLDivElement>(null);
+  const [position, setPosition] = useState({ left: false, right: true });
+  const watchlistSet = new Set(watchlist);
+  const orderedItems = [...items].sort((left, right) => (
+    Number(watchlistSet.has(titleKey(right))) - Number(watchlistSet.has(titleKey(left)))
+    || left.expiresOn - right.expiresOn
+  ));
+  const updateArrows = useCallback(() => {
+    const rail = railRef.current;
+    if (!rail) return;
+    setPosition({ left: rail.scrollLeft > 8, right: rail.scrollLeft + rail.clientWidth < rail.scrollWidth - 8 });
+  }, []);
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(updateArrows);
+    return () => window.cancelAnimationFrame(frame);
+  }, [items, updateArrows]);
+  const move = (direction: -1 | 1) => {
+    const rail = railRef.current;
+    if (!rail) return;
+    rail.scrollBy({ left: direction * Math.max(260, rail.clientWidth * 0.82), behavior: "smooth" });
+    window.setTimeout(updateArrows, 400);
+  };
+
+  return (
+    <section className="content-row expiring-home-row">
+      <header className="row-heading">
+        <div><span className="row-icon expiring-row-icon"><Clock3 /></span><span><h2>Läuft bald ab – muss zu Ende geschaut werden</h2><p>Bestätigte Abgänge bei deinen aktiven Streaming-Diensten</p></span></div>
+        <div className="expiring-row-actions"><button className="show-all-expiring" onClick={onShowAll}>Alle ansehen</button><div className="row-controls"><button onClick={() => move(-1)} disabled={!position.left} aria-label="Zurück"><ChevronLeft /></button><button onClick={() => move(1)} disabled={!position.right} aria-label="Weiter"><ChevronRight /></button></div></div>
+      </header>
+      <div className="rail-wrap expiring-rail-wrap">
+        <div className="rail expiring-rail" ref={railRef} onScroll={updateArrows}>
+          {orderedItems.slice(0, 24).map((item) => <ExpiringCard key={titleKey(item)} item={item} providers={providers} saved={watchlistSet.has(titleKey(item))} onToggle={onToggle} onOpen={onOpen} />)}
+        </div>
+        {position.left ? <button className="rail-arrow rail-arrow--left" onClick={() => move(-1)} aria-label="Zurück"><ChevronLeft /></button> : null}
+        {position.right ? <button className="rail-arrow rail-arrow--right" onClick={() => move(1)} aria-label="Weiter"><ChevronRight /></button> : null}
+      </div>
+    </section>
+  );
+}
+
+function ExpiringView({
+  items,
+  loading,
+  available,
+  subscriptions,
+  providers,
+  watchlist,
+  onToggle,
+  onOpen,
+  onOpenSettings,
+}: {
+  items: ExpiringTitle[];
+  loading: boolean;
+  available: boolean;
+  subscriptions: Subscription[];
+  providers: Provider[];
+  watchlist: string[];
+  onToggle: (title: Title) => void;
+  onOpen: (title: Title) => void;
+  onOpenSettings: () => void;
+}) {
+  const [tab, setTab] = useState<"catalog" | "subscriptions">("catalog");
+  const providerFor = (providerId: number) => providers.find((item) => item.id === providerId) ?? PROVIDERS.find((item) => item.id === providerId)!;
+  const subscriptionEndings = subscriptions.filter((item) => item.endsAt);
+
+  return (
+    <section className="simple-page expiring-page">
+      <div className="page-title"><span>RECHTZEITIG ANSCHAUEN</span><h1>Läuft bald ab</h1><p>Bestätigte Katalog-Abgänge zuerst – deine persönlichen Abo-Enden separat.</p></div>
+      <div className="expiring-tabs" role="tablist" aria-label="Ablaufdaten auswählen">
+        <button className={tab === "catalog" ? "active" : ""} onClick={() => setTab("catalog")} role="tab" aria-selected={tab === "catalog"}><Film /> Titel laufen ab <span>{items.length}</span></button>
+        <button className={tab === "subscriptions" ? "active" : ""} onClick={() => setTab("subscriptions")} role="tab" aria-selected={tab === "subscriptions"}><CalendarDays /> Deine Abo-Enden <span>{subscriptionEndings.length}</span></button>
+      </div>
+
+      {tab === "catalog" ? (
+        <>
+          <div className="expiry-reliability"><Check /><div><strong>Nur bestätigte Termine</strong><p>Es erscheinen nur vollständige Filme und Serien mit konkretem letztem Verfügbarkeitstag in Deutschland. Unbekannte oder geschätzte Daten werden ausgeblendet.</p></div></div>
+          {loading ? <div className="expiring-grid category-grid-loading">{Array.from({ length: 10 }, (_, index) => <span className="skeleton-card" key={index} />)}</div> : !available ? (
+            <div className="empty-state compact"><Info /><h2>Ablaufdaten gerade nicht verfügbar</h2><p>StreamHub zeigt keine Vermutungen. Sobald der Datenanbieter bestätigte Termine liefert, erscheinen sie hier automatisch.</p></div>
+          ) : items.length ? (
+            <div className="expiring-grid">{items.map((item) => <ExpiringCard key={titleKey(item)} item={item} providers={providers} saved={watchlist.includes(titleKey(item))} onToggle={onToggle} onOpen={onOpen} />)}</div>
+          ) : (
+            <div className="empty-state compact"><Check /><h2>Keine bestätigten Abgänge</h2><p>Für deine aktiven Dienste sind derzeit keine Titel mit einem konkreten Ablaufdatum gemeldet.</p></div>
+          )}
+          <p className="expiry-source-note">Ablaufdaten: Streaming Availability API by Movie of the Night · Region Deutschland · nur titelweite Abgänge.</p>
+        </>
+      ) : (
+        <div className="expiry-list">
+          {subscriptionEndings.map((item) => { const provider = providerFor(item.providerId); return <article key={item.providerId}><ProviderMark provider={provider} /><div><strong>{provider.name}</strong><span>Dein Abo endet am {new Date(item.endsAt).toLocaleDateString("de-DE")}</span></div><CalendarDays /></article>; })}
+          {!subscriptionEndings.length ? <div className="empty-state compact"><CalendarDays /><h2>Keine Abo-Enden hinterlegt</h2><p>Trage das Ende eines Abos in den Einstellungen ein.</p><button onClick={onOpenSettings}>Zu den Einstellungen</button></div> : null}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -924,10 +1114,11 @@ function WatchOrderCard({
 }) {
   const progressPercent = order.entryCount ? Math.min(100, Math.round((progress / order.entryCount) * 100)) : 0;
   return (
-    <article className="watch-order-card" style={{ "--order-accent": order.accent } as React.CSSProperties}>
+    <article className={`watch-order-card ${order.origin === "predicted" ? "predicted" : ""}`} style={{ "--order-accent": order.accent } as React.CSSProperties}>
       <button className="watch-order-card-visual" onClick={() => onOpen(order.id)} aria-label={`${order.title} öffnen`}>
         <Image src={`https://image.tmdb.org/t/p/w780${order.backdropPath}`} alt="" fill sizes="(max-width: 700px) 92vw, 31vw" />
         <span className="watch-order-card-shade" />
+        {order.origin === "predicted" ? <span className="watch-order-predicted-badge">Prognostiziert</span> : null}
         <span className="watch-order-card-copy"><small>{order.eyebrow}</small><strong>{order.title}</strong><em>{order.entryCount} Stationen</em></span>
       </button>
       <div className="watch-order-card-body">
@@ -1004,7 +1195,7 @@ function WatchOrderDetailView({
           <span>{order.eyebrow}</span>
           <h1>{order.title}</h1>
           <p>{order.description}</p>
-          <small>Geprüft · aktualisiert {order.updatedAt}</small>
+          <small>{order.origin === "predicted" ? `Prognostiziert · ${order.sourceLabel ?? "Metadaten"}` : "Manuell geprüft"} · aktualisiert {order.updatedAt}</small>
           <div>
             <button className={saved ? "primary active" : "primary"} onClick={() => onToggleSave(order.id)}><Bookmark fill={saved ? "currentColor" : "none"} /> {saved ? "Gespeichert" : "Reihenfolge speichern"}</button>
             <button className={liked ? "active" : ""} onClick={() => onToggleLike(order.id)}><Heart fill={liked ? "currentColor" : "none"} /> {liked ? "Gefällt dir" : "Gefällt mir"}</button>
@@ -1077,6 +1268,7 @@ function WatchOrdersView({
   onToggleWatched,
   onResetProgress,
   onOpenTitle,
+  onRememberPredicted,
 }: {
   orders: WatchOrderSummary[];
   selectedOrderId: string | null;
@@ -1091,15 +1283,51 @@ function WatchOrdersView({
   onToggleWatched: (orderId: string, entryId: string) => void;
   onResetProgress: (orderId: string) => void;
   onOpenTitle: (title: Title) => void;
+  onRememberPredicted: (orders: WatchOrderSummary[]) => void;
 }) {
   const [orderQuery, setOrderQuery] = useState("");
-  const [categoryFilter, setCategoryFilter] = useState<"all" | "anime" | "film">("all");
+  const [categoryFilter, setCategoryFilter] = useState<"all" | "anime" | "film" | "series">("all");
+  const [predictedOrders, setPredictedOrders] = useState<WatchOrderSummary[]>([]);
+  const [predicting, setPredicting] = useState(false);
   const normalizedQuery = normalizedText(orderQuery);
   const filtered = orders.filter((order) => {
     const categoryMatch = categoryFilter === "all" || order.category === categoryFilter;
     const searchMatch = !normalizedQuery || [order.title, ...order.aliases].some((value) => normalizedText(value).includes(normalizedQuery));
     return categoryMatch && searchMatch;
   });
+  const predictedFiltered = predictedOrders.filter((order) => categoryFilter === "all" || order.category === categoryFilter);
+
+  useEffect(() => {
+    const cleaned = orderQuery.trim();
+    if (cleaned.length < 2) {
+      setPredictedOrders([]);
+      setPredicting(false);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      setPredicting(true);
+      fetch(`/api/watch-orders/predict?q=${encodeURIComponent(cleaned)}`, { signal: controller.signal })
+        .then((response) => response.ok ? response.json() as Promise<{ results: WatchOrderSummary[] }> : Promise.reject())
+        .then((data) => {
+          const curatedRefs = new Set(orders.flatMap((order) => order.titleRefs));
+          const available = data.results.filter((order) => (
+            !order.titleRefs.some((ref) => curatedRefs.has(ref))
+            && !orders.some((curated) => normalizedText(curated.title) === normalizedText(order.title))
+          ));
+          setPredictedOrders(available);
+          onRememberPredicted(available);
+        })
+        .catch((reason: unknown) => {
+          if ((reason as { name?: string }).name !== "AbortError") setPredictedOrders([]);
+        })
+        .finally(() => setPredicting(false));
+    }, 450);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [onRememberPredicted, orderQuery, orders]);
 
   if (selectedOrderId) {
     return <WatchOrderDetailView orderId={selectedOrderId} saved={savedOrderIds.includes(selectedOrderId)} liked={likedOrderIds.includes(selectedOrderId)} watchedEntryIds={orderProgress[selectedOrderId] ?? []} ownedProviderIds={ownedProviderIds} onBack={onBack} onToggleSave={onToggleSave} onToggleLike={onToggleLike} onToggleWatched={onToggleWatched} onResetProgress={onResetProgress} onOpenTitle={onOpenTitle} />;
@@ -1108,17 +1336,20 @@ function WatchOrdersView({
   return (
     <section className="watch-orders-page">
       <section className="watch-orders-hero">
-        <div><span><ListOrdered /> NEU IN V0.9</span><h1>Was kommt<br />eigentlich zuerst?</h1><p>StreamHub sortiert Serien, Filme, Specials und Alternativen zu einer verständlichen Reihenfolge.</p></div>
-        <div className="watch-order-search"><Search /><input value={orderQuery} onChange={(event) => setOrderQuery(event.target.value)} placeholder="Franchise suchen, z. B. Sword Art Online …" aria-label="Reihenfolgen durchsuchen" />{orderQuery ? <button onClick={() => setOrderQuery("")} aria-label="Suche leeren"><X /></button> : null}<small>{filtered.length} kuratierte {filtered.length === 1 ? "Reihenfolge" : "Reihenfolgen"}</small></div>
+        <div><span><ListOrdered /> NEU IN V1.0</span><h1>Was kommt<br />eigentlich zuerst?</h1><p>Geprüfte Reihenfolgen haben Vorrang. Für weitere Film- und Serienwelten erstellt StreamHub eine klar markierte Prognose.</p></div>
+        <div className="watch-order-search"><Search /><input value={orderQuery} onChange={(event) => setOrderQuery(event.target.value)} placeholder="Filmreihe oder Serie suchen …" aria-label="Reihenfolgen durchsuchen" />{orderQuery ? <button onClick={() => setOrderQuery("")} aria-label="Suche leeren"><X /></button> : null}<small>{predicting ? "Prognose wird berechnet …" : normalizedQuery ? `${filtered.length + predictedFiltered.length} passende Ergebnisse` : `${filtered.length} geprüfte Reihenfolgen`}</small></div>
       </section>
-      <header className="watch-orders-heading"><div><span>KURATIERT STATT GERATEN</span><h2>Chronologische Reihenfolgen</h2></div><p>Alternative Fassungen und optionale Spin-offs werden sichtbar markiert.</p></header>
+      <header className="watch-orders-heading"><div><span>GEPRÜFT + INTELLIGENT ERGÄNZT</span><h2>Chronologische Reihenfolgen</h2></div><p>Prognosen basieren auf Sammlungen, Staffeln und Veröffentlichungsterminen und bleiben deutlich gekennzeichnet.</p></header>
       <div className="watch-order-type-tabs" aria-label="Reihenfolgen filtern">
         <button className={categoryFilter === "all" ? "active" : ""} onClick={() => setCategoryFilter("all")}>Alle <span>{orders.length}</span></button>
         <button className={categoryFilter === "film" ? "active" : ""} onClick={() => setCategoryFilter("film")}><Film /> Filme <span>{orders.filter((order) => order.category === "film").length}</span></button>
+        <button className={categoryFilter === "series" ? "active" : ""} onClick={() => setCategoryFilter("series")}><Tv /> Serien</button>
         <button className={categoryFilter === "anime" ? "active" : ""} onClick={() => setCategoryFilter("anime")}><Layers3 /> Anime <span>{orders.filter((order) => order.category === "anime").length}</span></button>
       </div>
-      {filtered.length ? <div className="watch-orders-grid">{filtered.map((order) => <WatchOrderCard key={order.id} order={order} saved={savedOrderIds.includes(order.id)} liked={likedOrderIds.includes(order.id)} progress={(orderProgress[order.id] ?? []).length} onOpen={onOpen} onToggleSave={onToggleSave} onToggleLike={onToggleLike} />)}</div> : <div className="empty-state compact"><Search /><h2>Noch keine passende Reihenfolge</h2><p>Versuche „Marvel“, „Star Wars“, „SAO“ oder „Demon Slayer“.</p><button onClick={() => { setOrderQuery(""); setCategoryFilter("all"); }}>Alle anzeigen</button></div>}
-      <div className="order-curation-note"><Info /><span><strong>Warum kuratiert?</strong> Automatisch erratene Listen verwechseln schnell Remakes, Recaps und Spin-offs. StreamHub ordnet diese bewusst ein und kennzeichnet Alternativen.</span></div>
+      {filtered.length ? <div className="watch-orders-grid">{filtered.map((order) => <WatchOrderCard key={order.id} order={order} saved={savedOrderIds.includes(order.id)} liked={likedOrderIds.includes(order.id)} progress={(orderProgress[order.id] ?? []).length} onOpen={onOpen} onToggleSave={onToggleSave} onToggleLike={onToggleLike} />)}</div> : null}
+      {normalizedQuery && predictedFiltered.length ? <><header className="predicted-orders-heading"><div><span>AUTOMATISCHE PROGNOSE</span><h2>Weitere passende Reihenfolgen</h2></div><p>Noch nicht redaktionell geprüft</p></header><div className="watch-orders-grid">{predictedFiltered.map((order) => <WatchOrderCard key={order.id} order={order} saved={savedOrderIds.includes(order.id)} liked={likedOrderIds.includes(order.id)} progress={(orderProgress[order.id] ?? []).length} onOpen={onOpen} onToggleSave={onToggleSave} onToggleLike={onToggleLike} />)}</div></> : null}
+      {!predicting && !filtered.length && !predictedFiltered.length ? <div className="empty-state compact"><Search /><h2>Noch keine passende Reihenfolge</h2><p>Versuche den Namen einer Filmreihe oder Serie. Einzelne Filme ohne Fortsetzung erzeugen bewusst keine Liste.</p><button onClick={() => { setOrderQuery(""); setCategoryFilter("all"); }}>Alle anzeigen</button></div> : null}
+      <div className="order-curation-note"><Info /><span><strong>So arbeitet V1.0:</strong> Manuell geprüfte Reihenfolgen haben immer Vorrang. Eine Prognose sortiert zusammengehörige Filme nach Veröffentlichung und Serien nach Staffelnummer – sie behauptet nicht, redaktionell geprüft zu sein.</span></div>
     </section>
   );
 }
@@ -1126,6 +1357,7 @@ function WatchOrdersView({
 function WatchlistView({
   titles,
   orders,
+  viewedTitles,
   activeTab,
   onChangeTab,
   watchlist,
@@ -1143,8 +1375,8 @@ function WatchlistView({
 }: {
   titles: Title[];
   orders: WatchOrderSummary[];
-  activeTab: "titles" | "orders";
-  onChangeTab: (tab: "titles" | "orders") => void;
+  activeTab: "titles" | "viewed" | "orders";
+  onChangeTab: (tab: "titles" | "viewed" | "orders") => void;
   watchlist: string[];
   ownedProviderIds: ReadonlySet<number>;
   savedOrderIds: string[];
@@ -1162,9 +1394,11 @@ function WatchlistView({
   return (
     <section className="simple-page watchlist-page">
       <div className="page-title"><span>DEINE LISTE</span><h1>Watchlist</h1><p>Titel und ganze Reihenfolgen an einem Ort.</p></div>
-      <div className="watchlist-tabs" role="tablist"><button className={activeTab === "titles" ? "active" : ""} onClick={() => onChangeTab("titles")}><Heart /> Titel <span>{watchlist.length}</span></button><button className={activeTab === "orders" ? "active" : ""} onClick={() => onChangeTab("orders")}><ListOrdered /> Reihenfolgen <span>{savedOrderIds.length}</span></button></div>
+      <div className="watchlist-tabs" role="tablist"><button className={activeTab === "titles" ? "active" : ""} onClick={() => onChangeTab("titles")}><Heart /> Titel <span>{watchlist.length}</span></button><button className={activeTab === "viewed" ? "active" : ""} onClick={() => onChangeTab("viewed")}><Eye /> Angesehen <span>{viewedTitles.length}</span></button><button className={activeTab === "orders" ? "active" : ""} onClick={() => onChangeTab("orders")}><ListOrdered /> Reihenfolgen <span>{savedOrderIds.length}</span></button></div>
       {activeTab === "titles" ? (
         titles.length ? <div className="catalog-grid">{titles.map((item) => <TitleCard key={titleKey(item)} title={item} saved ownedProviderIds={ownedProviderIds} onToggle={onToggleTitle} onOpen={onOpenTitle} />)}</div> : <div className="empty-state"><Heart /><h2>Noch keine Titel gemerkt</h2><p>Tippe bei einem Titel auf das Herz, dann erscheint er hier.</p><button onClick={onDiscoverTitles}>Titel entdecken</button></div>
+      ) : activeTab === "viewed" ? (
+        viewedTitles.length ? <div className="catalog-grid">{viewedTitles.map((item) => <TitleCard key={titleKey(item)} title={item} saved ownedProviderIds={ownedProviderIds} onToggle={onToggleTitle} onOpen={onOpenTitle} />)}</div> : <div className="empty-state"><Eye /><h2>Noch keine Titel angesehen</h2><p>Tippe bei einem Titel auf das Auge, dann erscheint er hier.</p><button onClick={onDiscoverTitles}>Titel entdecken</button></div>
       ) : savedOrders.length ? (
         <div className="watch-orders-grid">{savedOrders.map((order) => <WatchOrderCard key={order.id} order={order} saved liked={likedOrderIds.includes(order.id)} progress={(orderProgress[order.id] ?? []).length} onOpen={onOpenOrder} onToggleSave={onToggleSaveOrder} onToggleLike={onToggleLikeOrder} />)}</div>
       ) : <div className="empty-state"><ListOrdered /><h2>Noch keine Reihenfolge gespeichert</h2><p>Speichere eine kuratierte Film- oder Serienreihenfolge für später.</p><button onClick={onDiscoverOrders}>Reihenfolgen entdecken</button></div>}
@@ -1227,6 +1461,7 @@ function DetailModal({
             <Heart fill={saved ? "currentColor" : "none"} />
             <span>{saved ? "Gemerkt" : "Merken"}</span>
           </button>
+          {/* TODO implment already viewed button / and someone else if a new episode ist realsed you get a push up notification also show a calender on an extra view (maybe a new api is needed) */}
           <button className="detail-close" onClick={onClose} aria-label="Schließen"><X /></button>
           <div className="detail-title">
             <span>{detail.anime ? "ANIME" : detail.mediaType === "movie" ? "FILM" : "SERIE"}</span>
@@ -1302,8 +1537,21 @@ function SubscriptionsView({ subscriptions, providers, setSubscriptions }: { sub
   );
 }
 
-export function StreamHubApp() {
-  const [view, setView] = useState<View>("home");
+export function StreamHubApp({
+  initialView = "home",
+  initialOrderId = null,
+  initialCategoryId = null,
+}: {
+  initialView?: View;
+  initialOrderId?: string | null;
+  initialCategoryId?: number | null;
+}) {
+  const router = useRouter();
+  const validInitialCategoryId = initialCategoryId !== null
+    && CATEGORY_OPTIONS.some((category) => category.id === initialCategoryId)
+    ? initialCategoryId
+    : null;
+  const [view, setView] = useState<View>(initialView);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [selectedProviderIds, setSelectedProviderIds] = useState<number[]>([]);
   const [providers, setProviders] = useState(PROVIDERS);
@@ -1313,6 +1561,7 @@ export function StreamHubApp() {
   const [savedOrderIds, setSavedOrderIds] = useStoredState<string[]>("streamhub.watchOrders.saved", []);
   const [likedOrderIds, setLikedOrderIds] = useStoredState<string[]>("streamhub.watchOrders.liked", []);
   const [orderProgress, setOrderProgress] = useStoredState<Record<string, string[]>>("streamhub.watchOrders.progress", {});
+  const [rememberedPredictedOrders, setRememberedPredictedOrders] = useStoredState<WatchOrderSummary[]>("streamhub.watchOrders.predicted", []);
   const [taste, setTaste] = useStoredState<Record<string, number>>("streamhub.taste", {});
   const [notifications, setNotifications] = useStoredState<NotificationItem[]>("streamhub.notifications", [
     { id: "welcome", title: "Willkommen in StreamHub", text: "Deine Suche und Empfehlungen wurden verbessert." },
@@ -1324,14 +1573,17 @@ export function StreamHubApp() {
   const [searchResults, setSearchResults] = useState<Title[]>([]);
   const [detail, setDetail] = useState<Title | null>(null);
   const [watchOrders, setWatchOrders] = useState<WatchOrderSummary[]>([]);
-  const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
-  const [watchlistTab, setWatchlistTab] = useState<"titles" | "orders">("titles");
+  const [selectedOrderId, setSelectedOrderId] = useState<string | null>(initialView === "orders" ? initialOrderId : null);
+  const [watchlistTab, setWatchlistTab] = useState<"titles" | "viewed" | "orders">("titles");
   const [profileOpen, setProfileOpen] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [categoryCoverSets, setCategoryCoverSets] = useState<Record<string, string[]>>({});
   const [categoryCoverRotation, setCategoryCoverRotation] = useState(0);
-  const [selectedCategoryId, setSelectedCategoryId] = useState<number | null>(null);
+  const [selectedCategoryId, setSelectedCategoryId] = useState<number | null>(initialView === "discover" ? validInitialCategoryId : null);
   const [categoryQuery, setCategoryQuery] = useState("");
+  const [expiringTitles, setExpiringTitles] = useState<ExpiringTitle[]>([]);
+  const [expiringLoading, setExpiringLoading] = useState(true);
+  const [expiringAvailable, setExpiringAvailable] = useState(true);
   const searchRef = useRef<HTMLInputElement>(null);
   const searchContainerRef = useRef<HTMLDivElement>(null);
   const searchPanelRef = useRef<HTMLDivElement>(null);
@@ -1345,6 +1597,7 @@ export function StreamHubApp() {
     [activeProviderIds, selectedProviderIds],
   );
   const filteredProviderIds = selectedActiveProviderIds.length ? selectedActiveProviderIds : activeProviderIds;
+  const activeProviderKey = activeProviderIds.join(",");
   const tasteGenres = useMemo(() => Object.entries(taste).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([id]) => Number(id)), [taste]);
   const unread = notifications.filter((item) => !item.read).length;
   const categoryCovers = useMemo(() => Object.fromEntries(
@@ -1366,11 +1619,72 @@ export function StreamHubApp() {
   }, [detail, watchOrders]);
 
   useEffect(() => {
+    const categoryId = initialCategoryId !== null
+      && CATEGORY_OPTIONS.some((category) => category.id === initialCategoryId)
+      ? initialCategoryId
+      : null;
+    setView(initialView);
+    setSelectedOrderId(initialView === "orders" ? initialOrderId : null);
+    setSelectedCategoryId(initialView === "discover" ? categoryId : null);
+    setCategoryQuery("");
+    setSearchOpen(false);
+    setSidebarOpen(false);
+  }, [initialCategoryId, initialOrderId, initialView]);
+
+  useEffect(() => {
     fetch("/api/providers")
       .then((response) => response.json() as Promise<{ providers: Provider[] }>)
       .then((data) => setProviders(data.providers))
       .catch(() => undefined);
   }, []);
+
+  useEffect(() => {
+    if (!activeProviderKey) {
+      setExpiringTitles([]);
+      setExpiringLoading(false);
+      setExpiringAvailable(true);
+      return;
+    }
+    const controller = new AbortController();
+    setExpiringLoading(true);
+    fetch(`/api/expiring?providers=${encodeURIComponent(activeProviderKey)}`, { signal: controller.signal })
+      .then((response) => response.ok ? response.json() as Promise<ExpiringCatalogResponse> : Promise.reject())
+      .then((data) => {
+        setExpiringTitles(data.results);
+        setExpiringAvailable(data.source === "streaming-availability");
+      })
+      .catch((reason: unknown) => {
+        if ((reason as { name?: string }).name === "AbortError") return;
+        setExpiringTitles([]);
+        setExpiringAvailable(false);
+      })
+      .finally(() => setExpiringLoading(false));
+    return () => controller.abort();
+  }, [activeProviderKey]);
+
+  useEffect(() => {
+    const watchlistSet = new Set(watchlist);
+    const alerts = expiringTitles.flatMap((title): NotificationItem[] => {
+      if (!watchlistSet.has(titleKey(title))) return [];
+      const earliest = Math.min(...title.expiringProviders.map((entry) => entry.expiresOn));
+      const endingProviders = title.expiringProviders
+        .filter((entry) => entry.expiresOn === earliest)
+        .map((entry) => providers.find((provider) => provider.id === entry.providerId)?.name ?? PROVIDERS.find((provider) => provider.id === entry.providerId)?.name)
+        .filter((name): name is string => Boolean(name));
+      return [{
+        id: `expiring-${titleKey(title)}-${earliest}`,
+        title: `${title.title} läuft bald ab`,
+        text: `${endingProviders.join(" und ") || "Ein aktiver Dienst"} entfernt ${title.mediaType === "movie" ? "den Film" : "die Serie"} am ${formatExpiryDate(earliest)}.`,
+        urgent: daysUntilExpiry(earliest) <= 7,
+        read: false,
+      }];
+    });
+    if (!alerts.length) return;
+    setNotifications((current) => {
+      const additions = alerts.filter((alert) => !current.some((item) => item.id === alert.id));
+      return additions.length ? [...additions, ...current].slice(0, 80) : current;
+    });
+  }, [expiringTitles, providers, setNotifications, watchlist]);
 
   useEffect(() => {
     fetch("/api/watch-orders")
@@ -1463,12 +1777,22 @@ export function StreamHubApp() {
     setSearchOpen(false);
     setDetail(null);
     setSidebarOpen(false);
+    router.push(`/watch-orders/${encodeURIComponent(id)}`);
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   const toggleSavedOrder = (id: string) => {
     setSavedOrderIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
   };
+
+  const rememberPredictedOrders = useCallback((incoming: WatchOrderSummary[]) => {
+    if (!incoming.length) return;
+    setRememberedPredictedOrders((current) => {
+      const merged = new Map(current.map((order) => [order.id, order]));
+      incoming.forEach((order) => merged.set(order.id, order));
+      return [...merged.values()].slice(-30);
+    });
+  }, [setRememberedPredictedOrders]);
 
   const toggleLikedOrder = (id: string) => {
     setLikedOrderIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
@@ -1487,6 +1811,7 @@ export function StreamHubApp() {
     setSelectedCategoryId(null);
     setCategoryQuery("");
     setSidebarOpen(false);
+    router.push(VIEW_PATHS[next]);
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
   const openCategory = (categoryId: number) => {
@@ -1494,6 +1819,12 @@ export function StreamHubApp() {
     setSelectedCategoryId(categoryId);
     setCategoryQuery("");
     setSearchOpen(false);
+    router.push(`/discover?category=${categoryId}`);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+  const closeWatchOrder = () => {
+    setSelectedOrderId(null);
+    router.push(VIEW_PATHS.orders);
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
   const toggleProviderFilter = (providerId: number) => {
@@ -1531,20 +1862,22 @@ export function StreamHubApp() {
       orderProgress={orderProgress}
       ownedProviderIds={activeProviderSet}
       onOpen={openWatchOrder}
-      onBack={() => setSelectedOrderId(null)}
+      onBack={closeWatchOrder}
       onToggleSave={toggleSavedOrder}
       onToggleLike={toggleLikedOrder}
       onToggleWatched={toggleWatchedOrderEntry}
       onResetProgress={(id) => setOrderProgress((current) => ({ ...current, [id]: [] }))}
       onOpenTitle={openTitle}
+      onRememberPredicted={rememberPredictedOrders}
     />
   ) : view === "settings" ? (
     <SubscriptionsView subscriptions={subscriptions} providers={providers} setSubscriptions={setSubscriptions} />
   ) : view === "watchlist" ? (
     <WatchlistView
       titles={savedList}
-      orders={watchOrders}
+      orders={[...watchOrders, ...rememberedPredictedOrders.filter((predicted) => !watchOrders.some((order) => order.id === predicted.id))]}
       activeTab={watchlistTab}
+      viewedTitles={savedList.filter((title) => title.watched)}
       onChangeTab={setWatchlistTab}
       watchlist={watchlist}
       ownedProviderIds={activeProviderSet}
@@ -1560,7 +1893,7 @@ export function StreamHubApp() {
       onDiscoverOrders={() => changeView("orders")}
     />
   ) : view === "expiring" ? (
-    <section className="simple-page"><div className="page-title"><span>RECHTZEITIG ANSCHAUEN</span><h1>Läuft bald ab</h1><p>Bestätigte Ablaufdaten und deine persönlichen Abo-Enden an einem Ort.</p></div><div className="notice-banner"><Info /><div><strong>Verfügbarkeits-Verlauf wird vorbereitet</strong><p>TMDB zeigt aktuelle Verfügbarkeit, aber keine zuverlässigen künftigen Ablaufdaten. StreamHub sammelt dafür in einer späteren Version einen eigenen Verlauf. Deine eingetragenen Abo-Enden funktionieren schon jetzt.</p></div></div><div className="expiry-list">{subscriptions.filter((item) => item.endsAt).map((item) => { const provider = providers.find((provider) => provider.id === item.providerId)!; return <article key={item.providerId}><ProviderMark provider={provider} /><div><strong>{provider.name}</strong><span>Abo endet am {new Date(item.endsAt).toLocaleDateString("de-DE")}</span></div><CalendarDays /></article>; })}{!subscriptions.some((item) => item.endsAt) ? <div className="empty-state compact"><CalendarDays /><h2>Keine Ablaufdaten hinterlegt</h2><p>Trage sie in den Einstellungen bei deinen Streaming-Diensten ein.</p><button onClick={() => changeView("settings")}>Zu den Einstellungen</button></div> : null}</div></section>
+    <ExpiringView items={expiringTitles} loading={expiringLoading} available={expiringAvailable} subscriptions={subscriptions} providers={providers} watchlist={watchlist} onToggle={toggleWatchlist} onOpen={openTitle} onOpenSettings={() => changeView("settings")} />
   ) : (
     <>
       <section className={`hero ${view === "discover" ? "hero--compact" : ""}`}>
@@ -1585,6 +1918,7 @@ export function StreamHubApp() {
       ) : null}
 
       <div className="rows">
+        {view === "home" && expiringTitles.length ? <ExpiringRail items={expiringTitles} providers={providers} watchlist={watchlist} onToggle={toggleWatchlist} onOpen={openTitle} onShowAll={() => changeView("expiring")} /> : null}
         {ROWS.map((row, index) => <ContentRow key={`${row.id}-${filteredProviderIds.join("-")}`} title={row.title} subtitle={row.subtitle} icon={row.icon} kind={row.kind} providerIds={filteredProviderIds} ownedProviderIds={activeProviderSet} tasteGenres={tasteGenres} watchlist={watchlist} onToggle={toggleWatchlist} onOpen={openTitle} eager={index < 2} />)}
         <div className="category-rows-title"><span>KATEGORIEN FÜR DICH</span><h2>Stöbere Bahn für Bahn</h2><p>Weitere Reihen laden automatisch, sobald du nach unten scrollst.</p></div>
         {CATEGORY_OPTIONS.map((category) => <div className="category-row-anchor" id={`category-${category.id}`} key={`${category.id}-${filteredProviderIds.join("-")}`}><ContentRow title={category.label} subtitle={`Beliebte ${category.label}-Titel bei deinen Diensten`} icon={Layers3} coverPath={categoryCovers[String(category.id)]} kind={category.id === 90001 ? "anime" : "all"} genre={category.id === 90001 ? undefined : category.id} providerIds={filteredProviderIds} ownedProviderIds={activeProviderSet} tasteGenres={tasteGenres} watchlist={watchlist} onToggle={toggleWatchlist} onOpen={openTitle} /></div>)}
@@ -1618,8 +1952,8 @@ export function StreamHubApp() {
           <div className="top-actions" ref={menusRef}>
             <button className="icon-button" onClick={() => { setNotificationsOpen(!notificationsOpen); setProfileOpen(false); }} aria-label="Benachrichtigungen"><Bell />{unread ? <span>{unread}</span> : null}</button>
             <button className="profile-button" onClick={() => { setProfileOpen(!profileOpen); setNotificationsOpen(false); }} aria-label="Profil öffnen"><span>T</span><div><strong>Tim</strong><small>Persönliches Profil</small></div><ChevronDown /></button>
-            {notificationsOpen ? <div className="popover notification-popover"><header><div><strong>Benachrichtigungen</strong><span>{unread} ungelesen</span></div><button onClick={() => setNotifications(notifications.map((item) => ({ ...item, read: true })))}>Alle gelesen</button></header>{notifications.map((item) => <button className={item.read ? "read" : ""} key={item.id} onClick={() => setNotifications(notifications.map((other) => other.id === item.id ? { ...other, read: true } : other))}><i className={item.urgent ? "urgent" : ""} /><span><strong>{item.title}</strong><small>{item.text}</small></span></button>)}</div> : null}
-            {profileOpen ? <div className="popover profile-popover"><div className="profile-head"><span>T</span><div><strong>Tim</strong><small>Lokales StreamHub-Profil</small></div></div><div className="profile-numbers"><span><strong>{activeProviderIds.length}</strong>Dienste</span><span><strong>{watchlist.length + savedOrderIds.length}</strong>Watchlist</span></div><div className="tech-info"><MonitorCog /><span><strong>Technische Info · V0.9.1</strong><small>Next.js 16 · Turbopack (Entwicklung)</small><small>Produktiv ohne Dev-Anzeige</small></span></div><button onClick={() => { changeView("settings"); setProfileOpen(false); }}><Settings /> Einstellungen öffnen <ChevronRight /></button></div> : null}
+            {notificationsOpen ? <div className="popover notification-popover"><header><div><strong>Benachrichtigungen</strong><span>{unread} ungelesen</span></div><button onClick={() => setNotifications(notifications.map((item) => ({ ...item, read: true })))}>Alle gelesen</button></header>{notifications.map((item) => <button className={item.read ? "read" : ""} key={item.id} onClick={() => { setNotifications(notifications.map((other) => other.id === item.id ? { ...other, read: true } : other)); if (item.id.startsWith("expiring-")) { changeView("expiring"); setNotificationsOpen(false); } }}><i className={item.urgent ? "urgent" : ""} /><span><strong>{item.title}</strong><small>{item.text}</small></span></button>)}</div> : null}
+            {profileOpen ? <div className="popover profile-popover"><div className="profile-head"><span>T</span><div><strong>Tim</strong><small>Lokales StreamHub-Profil</small></div></div><div className="profile-numbers"><span><strong>{activeProviderIds.length}</strong>Dienste</span><span><strong>{watchlist.length + savedOrderIds.length}</strong>Watchlist</span></div><div className="tech-info"><MonitorCog /><span><strong>Technische Info · V1.0.1</strong><small>Next.js 16 · Turbopack (Entwicklung)</small><small>SQLite-Katalogdatenbank aktiv</small></span></div><button onClick={() => { changeView("settings"); setProfileOpen(false); }}><Settings /> Einstellungen öffnen <ChevronRight /></button></div> : null}
           </div>
         </header>
 

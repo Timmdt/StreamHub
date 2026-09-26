@@ -1,4 +1,4 @@
-import { titleDetails, watchOrderTitleDetails } from "./tmdb";
+import { titleDetails, watchOrderEntryImage, watchOrderTitleDetails } from "./tmdb";
 import type {
   MediaType,
   Title,
@@ -21,7 +21,7 @@ const entry = (
   kind: WatchOrderEntry["kind"],
   mediaType: MediaType,
   tmdbId: number,
-  extra: Partial<Pick<WatchOrderEntry, "imagePath" | "seasonLabel" | "episodeRange" | "optional" | "note">> = {},
+  extra: Partial<Pick<WatchOrderEntry, "imagePath" | "seasonNumber" | "imageEpisodeNumber" | "seasonLabel" | "episodeRange" | "optional" | "note">> = {},
 ): WatchOrderEntry => ({ id, title, description, year, kind, mediaType, tmdbId, ...extra });
 
 const SAO_SAFE_MAIN_IMAGE = "/yFZG86Zvdy6JuIlMW9eHxlVkct5.jpg";
@@ -319,6 +319,9 @@ function summary(definition: WatchOrderDefinition): WatchOrderSummary {
     accent: definition.accent,
     entryCount: definition.modes.find((mode) => mode.id === "story")?.entries.length ?? definition.modes[0]?.entries.length ?? 0,
     updatedAt: definition.updatedAt,
+    origin: "curated",
+    confidence: "high",
+    sourceLabel: "Manuell geprüft",
   };
 }
 
@@ -369,6 +372,21 @@ export async function getWatchOrder(id: string): Promise<WatchOrderDetails | nul
   });
   await Promise.all(workers);
 
+  const visualEntries = [...new Map(
+    definition.modes.flatMap((mode) => mode.entries).map((item) => [item.id, item]),
+  ).values()].filter((item) => item.mediaType === "tv");
+  const entryImages = new Map<string, string>();
+  await Promise.all(visualEntries.map(async (item, index) => {
+    const seasonFromLabel = Number(item.seasonLabel?.match(/staffel\s*(\d+)/i)?.[1]);
+    const episodeFromRange = Number(item.episodeRange?.match(/\d+/)?.[0]);
+    const image = await watchOrderEntryImage(item.mediaType, item.tmdbId, {
+      seasonNumber: item.seasonNumber ?? (Number.isFinite(seasonFromLabel) ? seasonFromLabel : undefined),
+      episodeNumber: item.imageEpisodeNumber ?? (Number.isFinite(episodeFromRange) ? episodeFromRange : undefined),
+      variant: index,
+    });
+    if (image) entryImages.set(item.id, image);
+  }));
+
   return {
     ...summary(definition),
     modes: definition.modes.map((mode) => ({
@@ -377,7 +395,13 @@ export async function getWatchOrder(id: string): Promise<WatchOrderDetails | nul
         ...item,
         media: (() => {
           const media = resolved.get(`${item.mediaType}:${item.tmdbId}`) ?? null;
-          return media && item.imagePath ? { ...media, backdropPath: item.imagePath } : media;
+          if (!media) return null;
+          const individualImage = entryImages.get(item.id);
+          if (individualImage) return { ...media, backdropPath: individualImage };
+          if (item.imagePath && definition.detailLevel !== "catalog" && item.mediaType !== "movie") {
+            return { ...media, backdropPath: item.imagePath };
+          }
+          return media;
         })(),
       })),
     })),

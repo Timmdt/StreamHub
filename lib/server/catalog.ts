@@ -1,5 +1,6 @@
 import { categories, categoryDefinition, genreForCategory, itemMatchesCategory } from "@/lib/categories";
 import { mockCatalog, providers } from "@/lib/mock-data";
+import { PROVIDERS as STREAMING_PROVIDERS } from "@/lib/providers";
 import { hasTmdbToken, tmdbFetch } from "@/lib/tmdb";
 import type {
   BrowsePayload,
@@ -102,7 +103,9 @@ export async function resolveProviderIds(keys: ProviderKey[], mediaType: MediaTy
   for (const provider of providers) {
     if (!keys.includes(provider.key)) continue;
     const aliases = provider.tmdbNames.map(normalize);
-    const match = list.results.find((candidate) => aliases.includes(normalize(candidate.provider_name)));
+    const configuredId = STREAMING_PROVIDERS.find((candidate) => candidate.name === provider.name)?.id;
+    const match = list.results.find((candidate) => aliases.includes(normalize(candidate.provider_name)))
+      ?? list.results.find((candidate) => candidate.provider_id === configuredId);
     if (match) result[provider.key] = match.provider_id;
   }
 

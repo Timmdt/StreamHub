@@ -1,4 +1,4 @@
-# StreamHub V0.9.1 – Reihenfolgen
+# StreamHub V1.0.1 – bestätigte Ablaufdaten
 
 Deine persönliche Streaming-Zentrale für Netflix, Prime Video, Disney+, Paramount+, Apple TV+ und Crunchyroll.
 
@@ -27,7 +27,46 @@ Deine persönliche Streaming-Zentrale für Netflix, Prime Video, Disney+, Paramo
 
 Ohne Token startet StreamHub automatisch mit Demo-Daten. Die Datei `.env.local` wird durch `.gitignore` vom Hochladen ausgeschlossen.
 
-## Neu in V0.9 – Reihenfolgen
+## Lokale Cache-Datenbank
+
+StreamHub verwendet eine lokale SQLite-Datenbank unter `.streamhub-data/streamhub.sqlite`. Dafür wird Node.js 22.5 oder neuer benötigt. Die Datei bleibt auf dem eigenen Rechner und ist über `.gitignore` ausgeschlossen.
+
+Die Datenbank enthält:
+
+- einen transaktionalen API-Cache mit Ablaufzeiten und Schutz vor parallelen Doppelanfragen
+- normalisierte Titel-, Anbieter- und Titel-Anbieter-Tabellen
+- einen lokalen Volltextindex für Titel, Originaltitel und Beschreibungen
+- sieben Tage wiederverwendbare Titelmetadaten
+- höchstens sechs Stunden alte Streaming-Verfügbarkeiten und Suchergebnisse
+- höchstens drei Stunden alte bestätigte Ablaufdaten
+
+Der bisherige Cache aus `.streamhub-data/cache-v1.json` wird beim ersten Start automatisch übernommen. Danach schreibt StreamHub nur noch gezielt betroffene Datensätze, anstatt bei jeder Änderung eine vollständige JSON-Datei neu zu speichern. Der lokale Katalog wächst automatisch mit jeder Suche und jeder geöffneten Kategorie. Dadurch werden bereits bekannte Suchanfragen und Inhalte ohne erneute externe API-Aufrufe ausgeliefert.
+
+Unter [`/api/health`](http://localhost:3000/api/health) zeigt StreamHub unter anderem Datenbankgröße, Cache-Einträge, indizierte Titel, Anbieter-Verknüpfungen und Cache-Treffer an.
+
+## Neu in V1.0.1
+
+- die Seite „Läuft bald ab“ zeigt als ersten Tab echte Katalog-Abgänge der aktiven Dienste
+- unbekannte oder geschätzte Termine werden bewusst ausgeschlossen; angezeigt werden nur konkrete letzte Verfügbarkeitstage für Deutschland
+- Meldungen betreffen ausschließlich vollständige Filme oder Serien, nicht einzelne Staffeln oder Folgen
+- jeder Eintrag nennt den betroffenen Dienst, das genaue Datum und – sofern verifiziert – dessen exakten Titellink
+- persönliche Abo-Enden bleiben als eigener zweiter Tab erhalten
+- auf der Startseite erscheint eine Netflix-artige Ablauf-Bahn; Watchlist-Titel stehen darin zuerst
+- läuft eine Serie aus der Watchlist bald bei einem aktiven Dienst ab, legt StreamHub automatisch eine Benachrichtigung an
+- Ablaufdaten werden drei Stunden lokal zwischengespeichert, um zusätzliche API-Aufrufe gering zu halten
+
+## Neu in V1.0
+
+- bestehende, manuell geprüfte Reihenfolgen behalten immer Vorrang
+- die Suche kann für weitere Serien und Filmsammlungen automatisch eine deutlich markierte Reihenfolge prognostizieren
+- Serien werden vorsichtig nach Staffelnummer und Erstausstrahlung, Filmsammlungen nach Veröffentlichung geordnet
+- jede automatisch erzeugte Liste erklärt ihre Datenbasis und behauptet nicht, redaktionell geprüft zu sein
+- Stationen verwenden individuelle Film-, Staffel- oder Episodenmotive statt eines mehrfach wiederholten Franchise-Bildes
+- ein kleiner persistenter lokaler Datencache reduziert TMDB- und Streaming-Availability-Aufrufe auch über Server-Neustarts hinweg
+- stabile Metadaten bleiben sieben Tage, Streaming-Verfügbarkeit sechs Stunden im Cache
+- Cache, API-Schlüssel, Build-Ausgaben und persönliche Einstellungen werden nicht mit einem Projekt-ZIP geteilt
+
+## Enthalten seit V0.9 – Reihenfolgen
 
 - eigene Seite „Reihenfolgen“ für kuratierte Film-, Serien-, Staffel- und Special-Abfolgen
 - Story-/Empfehlungsreihenfolge und Veröffentlichungsreihenfolge umschaltbar
@@ -100,7 +139,7 @@ StreamHub verbindet TMDB-Katalogdaten mit den exakten Zielen der Streaming Avail
 
 Folgen- und Direktlinkdaten bereitgestellt von Streaming Availability API by Movie of the Night. Region: Deutschland.
 
-## Nächster V0.9-Schritt
+## Nächster Schritt
 
 - weitere Streaming-Dienste mit eigenen Logos selbst hinzufügen und verwalten
 - Studiosuche: Begriffe wie Marvel, Studio Ghibli, Pixar oder DreamWorks sollen ausschließlich Titel des ausgewählten Studios zeigen

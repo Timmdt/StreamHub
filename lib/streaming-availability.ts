@@ -1,4 +1,5 @@
 import { PROVIDER_BY_ID, PROVIDERS, trustedProviderTitleUrl } from "./providers";
+import { localCacheKey, withLocalCache } from "./local-cache";
 import type { EpisodeGuide, EpisodeProviderLink, MediaType, Provider } from "./types";
 
 const DIRECT_API_ROOT = "https://api.movieofthenight.com/v4";
@@ -182,31 +183,37 @@ export async function streamingAvailability(
   url.searchParams.set("series_granularity", mediaType === "tv" ? "episode" : "show");
 
   try {
-    const response = await fetch(url, {
-      headers: { ...config.headers, accept: "application/json" },
-      next: { revalidate: 60 * 60 * 6 },
-    });
+    return await withLocalCache(
+      localCacheKey("streaming-availability", `${config.root}:${REGION}:${mediaType}:${tmdbId}`),
+      1000 * 60 * 60 * 6,
+      async () => {
+        const response = await fetch(url, {
+          headers: { ...config.headers, accept: "application/json" },
+          next: { revalidate: 60 * 60 * 6 },
+        });
 
-    if (response.status === 404) {
-      return {
-        titleLinks: [],
-        linkedProviders: [],
-        episodeGuide: mediaType === "tv" ? { status: "not_found", seasons: [] } : undefined,
-      };
-    }
-    if (!response.ok) throw new Error(`Streaming Availability API ${response.status}`);
+        if (response.status === 404) {
+          return {
+            titleLinks: [],
+            linkedProviders: [],
+            episodeGuide: mediaType === "tv" ? { status: "not_found" as const, seasons: [] } : undefined,
+          };
+        }
+        if (!response.ok) throw new Error(`Streaming Availability API ${response.status}`);
 
-    const show = await response.json() as RawShow;
-    const titleLinks = exactProviderLinks(optionsForGermany(show.streamingOptions));
-    const linkedProviders = titleLinks
-      .map((link) => PROVIDER_BY_ID.get(link.providerId))
-      .filter((provider): provider is Provider => Boolean(provider));
+        const show = await response.json() as RawShow;
+        const titleLinks = exactProviderLinks(optionsForGermany(show.streamingOptions));
+        const linkedProviders = titleLinks
+          .map((link) => PROVIDER_BY_ID.get(link.providerId))
+          .filter((provider): provider is Provider => Boolean(provider));
 
-    return {
-      titleLinks,
-      linkedProviders,
-      episodeGuide: mediaType === "tv" ? toEpisodeGuide(show) : undefined,
-    };
+        return {
+          titleLinks,
+          linkedProviders,
+          episodeGuide: mediaType === "tv" ? toEpisodeGuide(show) : undefined,
+        };
+      },
+    );
   } catch (error) {
     console.error(error);
     return {

@@ -67,6 +67,24 @@ export type CatalogResponse = {
   results: Title[];
 };
 
+export type ExpiringProvider = {
+  providerId: number;
+  expiresOn: number;
+  link?: string;
+};
+
+export type ExpiringTitle = Title & {
+  expiresOn: number;
+  expiringProviders: ExpiringProvider[];
+};
+
+export type ExpiringCatalogResponse = {
+  source: "streaming-availability" | "unavailable";
+  results: ExpiringTitle[];
+  hasMore: boolean;
+  fetchedAt: string;
+};
+
 export type Subscription = {
   providerId: number;
   active: boolean;
@@ -79,7 +97,7 @@ export type Subscription = {
 
 export type WatchOrderItemKind = "series" | "season" | "movie" | "special" | "alternative";
 
-export type WatchOrderModeId = "story" | "release";
+export type WatchOrderModeId = "story" | "release" | "predicted";
 
 export type WatchOrderEntry = {
   id: string;
@@ -90,6 +108,8 @@ export type WatchOrderEntry = {
   mediaType: MediaType;
   tmdbId: number;
   imagePath?: string;
+  seasonNumber?: number;
+  imageEpisodeNumber?: number;
   seasonLabel?: string;
   episodeRange?: string;
   optional?: boolean;
@@ -109,13 +129,16 @@ export type WatchOrderSummary = {
   eyebrow: string;
   description: string;
   aliases: string[];
-  category: "anime" | "film";
+  category: "anime" | "film" | "series";
   titleRefs: string[];
   backdropPath: string;
   posterPath: string;
   accent: string;
   entryCount: number;
   updatedAt: string;
+  origin?: "curated" | "predicted";
+  confidence?: "high" | "medium" | "low";
+  sourceLabel?: string;
 };
 
 export type WatchOrderResolvedEntry = WatchOrderEntry & {

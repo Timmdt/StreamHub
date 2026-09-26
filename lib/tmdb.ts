@@ -1,4 +1,7 @@
 import { demoTitles } from "./demo";
+import { searchIndexedTitles, upsertCatalogTitles } from "./catalog-database";
+import { localCacheKey, withLocalCache } from "./local-cache";
+import { providers as catalogProviders } from "./mock-data";
 import { CATEGORY_OPTIONS, PROVIDER_BY_ID, PROVIDERS, verifiedSeriesProviderLinks } from "./providers";
 import { streamingAvailability } from "./streaming-availability";
 import type { CatalogResponse, EpisodeGuide, MediaType, Provider, Title } from "./types";
@@ -27,6 +30,14 @@ type TmdbResult = {
   runtime?: number | null;
   number_of_seasons?: number | null;
   homepage?: string | null;
+  seasons?: {
+    season_number?: number;
+    name?: string;
+    overview?: string;
+    air_date?: string | null;
+    episode_count?: number;
+    poster_path?: string | null;
+  }[];
 };
 
 type TmdbPage = {
@@ -49,6 +60,7 @@ type WatchProviders = {
 
 type TmdbSeasonDetails = {
   name?: string;
+  poster_path?: string | null;
   episodes?: {
     episode_number?: number;
     name?: string;
@@ -57,6 +69,37 @@ type TmdbSeasonDetails = {
     still_path?: string | null;
   }[];
 };
+
+export async function watchOrderEntryImage(
+  mediaType: MediaType,
+  id: number,
+  options: { seasonNumber?: number; episodeNumber?: number; variant?: number } = {},
+) {
+  if (mediaType !== "tv" || !hasTmdbToken()) return null;
+  try {
+    const series = await tmdb<TmdbResult>(`/tv/${id}`, {}, 60 * 60 * 24 * 7);
+    const regularSeasons = (series.seasons ?? [])
+      .filter((season) => (season.season_number ?? 0) > 0)
+      .sort((left, right) => (left.season_number ?? 0) - (right.season_number ?? 0));
+    const variant = Math.max(0, options.variant ?? 0);
+    const seasonNumber = options.seasonNumber
+      ?? regularSeasons[variant % Math.max(regularSeasons.length, 1)]?.season_number
+      ?? 1;
+    const season = await tmdb<TmdbSeasonDetails>(
+      `/tv/${id}/season/${seasonNumber}`,
+      {},
+      60 * 60 * 24 * 7,
+    );
+    const stills = (season.episodes ?? []).filter((episode) => episode.still_path);
+    const exact = options.episodeNumber
+      ? stills.find((episode) => episode.episode_number === options.episodeNumber)
+      : undefined;
+    const selected = exact ?? stills[variant % Math.max(stills.length, 1)];
+    return selected?.still_path ?? season.poster_path ?? null;
+  } catch {
+    return null;
+  }
+}
 
 export function hasTmdbToken() {
   return Boolean(process.env.TMDB_READ_TOKEN?.trim());
@@ -74,12 +117,15 @@ export async function tmdbFetch<T>(
   Object.entries(params).forEach(([key, value]) => {
     if (value !== undefined && value !== "") url.searchParams.set(key, String(value));
   });
-  const response = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}`, accept: "application/json" },
-    next: { revalidate: revalidateSeconds },
+  const key = localCacheKey("tmdb", `${url.pathname}?${url.searchParams.toString()}`);
+  return withLocalCache<T>(key, revalidateSeconds * 1000, async () => {
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}`, accept: "application/json" },
+      next: { revalidate: revalidateSeconds },
+    });
+    if (!response.ok) throw new Error(`TMDB ${response.status} for ${path}`);
+    return (await response.json()) as T;
   });
-  if (!response.ok) throw new Error(`TMDB ${response.status} for ${path}`);
-  return (await response.json()) as T;
 }
 
 const tmdb = tmdbFetch;
@@ -152,12 +198,29 @@ async function hydrateMany(results: TmdbResult[], fallbackType: MediaType, maxim
     .filter((item) => item.poster_path || item.backdrop_path)
     .filter((item) => item.media_type !== "person")
     .slice(0, maximum);
-  return Promise.all(usable.map((item) => hydrate(item, fallbackType)));
+  const hydrated = await Promise.all(usable.map((item) => hydrate(item, fallbackType)));
+  upsertCatalogTitles(hydrated);
+  return hydrated;
 }
 
-function providerQuery(providerIds: number[]) {
-  const ids = providerIds.filter((id) => PROVIDER_BY_ID.has(id));
-  return (ids.length ? ids : PROVIDERS.map((provider) => provider.id)).join("|");
+async function providerQuery(providerIds: number[], mediaType: MediaType) {
+  const requestedIds = providerIds.filter((id) => PROVIDER_BY_ID.has(id));
+  const requested = requestedIds.length
+    ? requestedIds
+    : PROVIDERS.map((provider) => provider.id);
+  const data = await tmdb<{ results: { provider_id: number; provider_name: string }[] }>(
+    `/watch/providers/${mediaType}`,
+    { watch_region: REGION },
+  );
+  const normalize = (value: string) => value.toLocaleLowerCase("de").replace(/[^a-z0-9+]/g, "");
+  const resolved = requested.flatMap((id) => {
+    const provider = PROVIDER_BY_ID.get(id);
+    const aliases = catalogProviders.find((item) => item.name === provider?.name)?.tmdbNames ?? [provider?.name ?? ""];
+    const match = data.results.find((item) => aliases.some((alias) => normalize(alias) === normalize(item.provider_name)))
+      ?? data.results.find((item) => item.provider_id === id);
+    return match ? [match.provider_id] : [];
+  });
+  return resolved.length ? resolved.join("|") : "0";
 }
 
 const tvGenreMap: Record<number, number> = {
@@ -187,7 +250,7 @@ async function discoverType(
   return tmdb<TmdbPage>(`/discover/${mediaType}`, {
     page,
     watch_region: REGION,
-    with_watch_providers: providerQuery(providerIds),
+    with_watch_providers: await providerQuery(providerIds, mediaType),
     with_watch_monetization_types: "flatrate|free|ads",
     sort_by: "popularity.desc",
     "vote_count.gte": 20,
@@ -211,7 +274,7 @@ function demoCatalog(kind: string, page: number, genre?: number, query?: string)
   return { source: "demo", page, totalPages: 8, results: rotated.slice(0, 24) };
 }
 
-export async function discoverCatalog(options: {
+async function loadDiscoverCatalog(options: {
   kind: string;
   page: number;
   providerIds: number[];
@@ -260,6 +323,22 @@ export async function discoverCatalog(options: {
     console.error(error);
     return demoCatalog(kind, page, genre);
   }
+}
+
+export async function discoverCatalog(options: {
+  kind: string;
+  page: number;
+  providerIds: number[];
+  genre?: number;
+  tasteGenres?: number[];
+}) {
+  if (!hasTmdbToken()) return loadDiscoverCatalog(options);
+  const cacheKey = localCacheKey("catalog-discover-v5", JSON.stringify({
+    ...options,
+    providerIds: [...new Set(options.providerIds)].sort((a, b) => a - b),
+    tasteGenres: [...new Set(options.tasteGenres ?? [])].sort((a, b) => a - b),
+  }));
+  return withLocalCache(cacheKey, 1000 * 60 * 30, () => loadDiscoverCatalog(options));
 }
 
 const genreTerms: Record<string, number> = {
@@ -311,7 +390,7 @@ function searchScore(title: Title, query: string, year?: string) {
   return score;
 }
 
-export async function searchCatalog(query: string, providerIds: number[]) {
+async function loadSearchCatalog(query: string, providerIds: number[]) {
   const intent = parseSearchIntent(query);
   if (!hasTmdbToken()) return demoCatalog("all", 1, intent.genre, intent.genre ? undefined : query);
 
@@ -319,6 +398,16 @@ export async function searchCatalog(query: string, providerIds: number[]) {
     if (intent.genre) {
       const kind = intent.genre === 90001 ? "anime" : intent.mediaType === "movie" ? "movies" : intent.mediaType === "tv" ? "series" : "all";
       return discoverCatalog({ kind, page: 1, providerIds, genre: intent.genre === 90001 ? 16 : intent.genre });
+    }
+
+    const indexed = searchIndexedTitles(query, providerIds, 36);
+    const normalizedQuery = intent.normalized;
+    const exactIndexedMatch = indexed.some((title) => (
+      title.title.toLocaleLowerCase("de") === normalizedQuery
+      || title.originalTitle?.toLocaleLowerCase("de") === normalizedQuery
+    ));
+    if (indexed.length >= 12 || exactIndexedMatch) {
+      return { source: "tmdb" as const, page: 1, totalPages: 1, results: indexed };
     }
 
     const pages = await Promise.all(
@@ -344,6 +433,15 @@ export async function searchCatalog(query: string, providerIds: number[]) {
   }
 }
 
+export async function searchCatalog(query: string, providerIds: number[]) {
+  if (!hasTmdbToken()) return loadSearchCatalog(query, providerIds);
+  const cacheKey = localCacheKey("catalog-search-v3", JSON.stringify({
+    query: query.trim().toLocaleLowerCase("de"),
+    providerIds: [...new Set(providerIds)].sort((a, b) => a - b),
+  }));
+  return withLocalCache(cacheKey, 1000 * 60 * 60 * 6, () => loadSearchCatalog(query, providerIds));
+}
+
 export async function searchCategoryCatalog(query: string, categoryId: number, providerIds: number[]) {
   const data = await searchCatalog(query, providerIds);
   const selectedProviders = new Set(providerIds.length ? providerIds : PROVIDERS.map((provider) => provider.id));
@@ -361,8 +459,10 @@ export async function searchCategoryCatalog(query: string, categoryId: number, p
 export async function watchOrderTitleDetails(mediaType: MediaType, id: number) {
   if (!hasTmdbToken()) return demoTitles().find((title) => title.id === id) ?? null;
   try {
-    const raw = await tmdb<TmdbResult>(`/${mediaType}/${id}`);
-    return hydrate(raw, mediaType);
+    const raw = await tmdb<TmdbResult>(`/${mediaType}/${id}`, {}, 60 * 60 * 24 * 7);
+    const title = await hydrate(raw, mediaType);
+    upsertCatalogTitles([title]);
+    return title;
   } catch (error) {
     console.error(error);
     return null;
@@ -401,7 +501,7 @@ export async function titleDetails(mediaType: MediaType, id: number) {
     hydrated.providers.forEach((provider) => {
       providers.set(provider.id, { ...providers.get(provider.id), ...provider });
     });
-    return {
+    const title = {
       ...hydrated,
       providers: [...providers.values()].map((provider) => ({
         ...provider,
@@ -409,6 +509,8 @@ export async function titleDetails(mediaType: MediaType, id: number) {
       })),
       episodeGuide: episodeGuideWithFallbacks,
     };
+    upsertCatalogTitles([title]);
+    return title;
   } catch (error) {
     console.error(error);
     return null;
